@@ -22,24 +22,37 @@ Lain-lain: log masuk Guru / Pentadbir / Tetamu (baca sahaja), carian pantas **Ct
 
 ## Cara guna
 
-### A. Demo pantas (tanpa pemasangan)
-Buka `index.html` terus dalam pelayar (atau aktifkan **GitHub Pages** untuk repo ini). Data demo dimuatkan dan disimpan dalam pelayar anda sahaja.
+### A. Demo pantas (tanpa Firebase)
+Biarkan `FIREBASE_CONFIG` kosong dan buka `index.html` dalam pelayar. Data demo disimpan dalam pelayar itu sahaja.
 Log masuk: **Pentadbir Sistem** / katalaluan **admin123**.
 
-### B. Pasang sebagai Web App Google Apps Script (data dalam Google Sheet, dikongsi semua guru)
-1. Cipta **Google Sheet** baharu → **Extensions → Apps Script**.
-2. Tampal kandungan `Code.gs` ke dalam fail `Code.gs`.
-3. Klik **+ → HTML**, namakan `index`, tampal kandungan `index.html`.
-4. **Deploy → New deployment → Web app** — *Execute as:* **Me**, *Who has access:* **Anyone** (atau dalam domain sekolah).
-5. Buka URL web app → log masuk **Pentadbir Sistem** / **admin123** → tukar katalaluan di **Pengurusan & Admin → Profil Sekolah**.
-6. Mula dengan **Sandaran Data → Muat Data Demo** untuk mencuba, atau terus isi Data Guru, Daftar Unit dan Import Murid.
+### B. Guna Firebase (data dikongsi semua guru)
+1. Buka <https://console.firebase.google.com> → **Add project** (Google Analytics tidak perlu).
+2. **Build → Firestore Database → Create database** → pilih lokasi `asia-southeast1` (Singapura) → *Production mode*.
+3. **Build → Authentication → Get started → Sign-in method** → aktifkan **Email/Password** dan **Anonymous**.
+4. **Authentication → Users → Add user** → cipta akaun pentadbir, cth. `admin@sekolah.edu.my` + katalaluan (min. 6 aksara).
+5. **Project settings (⚙️) → Your apps → Web (`</>`)** → daftar app → salin objek `firebaseConfig`.
+6. Dalam `index.html`, isi `FIREBASE_CONFIG` dan tukar `ADMIN_EMAIL` kepada e-mel pentadbir di langkah 4.
+7. **Firestore Database → Rules** → tampal kandungan `firestore.rules` (tukar e-mel pentadbir di dalamnya juga) → **Publish**.
+8. Hos `index.html` di **GitHub Pages** (Settings → Pages → branch `main`) atau **Firebase Hosting** (`firebase deploy`).
+9. **Authentication → Settings → Authorized domains** → tambah domain hos anda (cth. `skagamamiri.github.io`).
+10. Buka sistem → log masuk **Pentadbir Sistem** dengan katalaluan langkah 4 → **Pengurusan & Admin → Sandaran Data → Muat Data Demo** untuk mencuba, atau terus isi Data Guru, Unit dan Murid.
 
-Setiap koleksi disimpan dalam tab tersendiri (`murid`, `guru`, `unit`, `perjumpaan`, `program`, `jawatan`, `ekstra`, `pencapaian`, `settings`). Katalaluan disemak di pelayan dan setiap perubahan memerlukan token sesi (6 jam).
+> `apiKey` Firebase bukan rahsia — keselamatan data dikawal oleh **Firestore Rules** dan **Firebase Authentication**.
+
+### Struktur Firestore
+| Koleksi | Kandungan | Siapa boleh ubah |
+|---|---|---|
+| `tetapan/utama` | profil sekolah, logo, tema, pemberat markah | Pentadbir |
+| `murid`, `guru`, `unit` | data induk | Pentadbir |
+| `perjumpaan`, `program`, `jawatan`, `ekstra`, `pencapaian` | rekod aktiviti | Guru & Pentadbir |
+| `guruPrivate` | No. KP guru + uid akaun | Pentadbir sahaja (baca & tulis) |
+| `roles` | peranan akaun guru | Pentadbir |
 
 ## Log masuk
-- **Pentadbir** — semua akses termasuk Setup.
-- **Guru** — pilih nama, katalaluan = No. KP (tanpa '-'). Boleh isi laporan, kehadiran, program, jawatan, pencapaian.
-- **Tetamu Awam** — lihat sahaja.
+- **Pentadbir** — semua akses termasuk Setup. Katalaluan boleh ditukar di Profil Sekolah.
+- **Guru** — pilih nama, katalaluan = No. KP. Akaun Firebase guru dicipta **automatik** apabila pentadbir menyimpan data guru (tukar No. KP = katalaluan baharu). Boleh isi laporan, kehadiran, program, jawatan, ekstra dan pencapaian.
+- **Tetamu Awam** — lihat sahaja (No. KP murid disembunyikan). Untuk mematikan mod tetamu sepenuhnya, ubah `canRead()` dalam `firestore.rules`.
 
 ## Import murid dari Excel
 Di **Data Murid → Import / Tampal Excel**, salin lajur berikut dan tampal:

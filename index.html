@@ -261,10 +261,22 @@ table.t{width:100%;border-collapse:collapse;font-size:12.5px}
 <script>
 /* =========================================================
    SISTEM PENGURUSAN KOKURIKULUM SEKOLAH — teras
-   Mod 1: Google Apps Script (google.script.run → Google Sheet)
-   Mod 2: Fail HTML biasa (data dalam localStorage pelayar)
+   Mod 1: Firebase (Firestore + Firebase Auth) — isi FIREBASE_CONFIG
+   Mod 2: Demo tempatan (localStorage) — jika FIREBASE_CONFIG kosong
    ========================================================= */
-const GAS = typeof google !== 'undefined' && google.script && google.script.run;
+/* ====== TETAPAN FIREBASE — salin dari Firebase Console > Project settings > Your apps ====== */
+const FIREBASE_CONFIG = {
+  apiKey: '',
+  authDomain: '',
+  projectId: '',
+  storageBucket: '',
+  messagingSenderId: '',
+  appId: ''
+};
+/* E-mel akaun pentadbir (cipta di Firebase Console > Authentication > Users). Mesti sama dengan firestore.rules */
+const ADMIN_EMAIL = 'admin@sekolah.edu.my';
+/* ========================================================================================== */
+const FB_ON = !!FIREBASE_CONFIG.apiKey;
 const LS_KEY = 'koko_db_v1';
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
@@ -340,48 +352,132 @@ const empty = (msg, ic = 'fa-inbox') => `<div class="empty"><i class="fa-solid $
 const opt = (v, l, sel) => `<option value="${esc(v)}" ${String(sel) === String(v) ? 'selected' : ''}>${esc(l ?? v)}</option>`;
 const val = id => { const e = document.getElementById(id); return e ? e.value.trim() : ''; };
 
-/* ---------------- Lapisan data ---------------- */
-function gas(fn, ...args) {
-  return new Promise((res, rej) => google.script.run.withSuccessHandler(res).withFailureHandler(e => rej(e))[fn](...args));
+/* ---------------- Lapisan data (Firebase / tempatan) ---------------- */
+const FBV = '10.12.2';
+const FB = { app: null, auth: null, db: null, a: null, f: null };
+const clean = o => JSON.parse(JSON.stringify(o));
+const fbErr = e => {
+  const c = (e && e.code) || '';
+  return ({ 'permission-denied': 'Tiada kebenaran. Sila log masuk semula atau semak Firestore Rules.', 'auth/invalid-credential': 'Katalaluan salah.', 'auth/wrong-password': 'Katalaluan salah.', 'auth/user-not-found': 'Akaun tidak dijumpai.', 'auth/too-many-requests': 'Terlalu banyak cubaan. Cuba sebentar lagi.', 'auth/network-request-failed': 'Tiada sambungan internet.', 'auth/operation-not-allowed': 'Kaedah log masuk belum diaktifkan dalam Firebase Console (Email/Password & Anonymous).', 'unavailable': 'Pelayan Firebase tidak dapat dihubungi.' })[c.replace('firestore/', '')] || (e && e.message) || 'Ralat pelayan';
+};
+async function fbInit() {
+  if (FB.app) return;
+  const base = `https://www.gstatic.com/firebasejs/${FBV}/`;
+  const [ap, a, f] = await Promise.all([import(base + 'firebase-app.js'), import(base + 'firebase-auth.js'), import(base + 'firebase-firestore.js')]);
+  FB.ap = ap; FB.a = a; FB.f = f;
+  FB.app = ap.initializeApp(FIREBASE_CONFIG);
+  FB.auth = a.getAuth(FB.app);
+  FB.db = f.getFirestore(FB.app);
+  await new Promise(res => { const un = a.onAuthStateChanged(FB.auth, () => { un(); res(); }); });
+  if (!FB.auth.currentUser) await a.signInAnonymously(FB.auth);
+}
+async function sha(t) { const b = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(t)); return [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, '0')).join(''); }
+const icDigits = v => String(v || '').replace(/\D/g, '');
+async function guruCred(guruId, ic) { const d = icDigits(ic); return { email: `${guruId}.${(await sha('koko|' + d)).slice(0, 12)}@guru.koko.app`.toLowerCase(), pw: 'koko-' + d }; }
+/** Cipta / pastikan akaun Firebase Auth untuk guru (menggunakan app kedua supaya admin tidak terlog keluar). */
+async function ensureGuruAccount(g, priv) {
+  if (!icDigits(g.ic)) return priv || {};
+  const { a, f } = FB;
+  if (!FB.app2) { FB.app2 = FB.ap.initializeApp(FIREBASE_CONFIG, 'pendaftar'); FB.auth2 = a.getAuth(FB.app2); await a.setPersistence(FB.auth2, a.inMemoryPersistence); }
+  const { email, pw } = await guruCred(g.id, g.ic);
+  let cred;
+  try { cred = await a.createUserWithEmailAndPassword(FB.auth2, email, pw); }
+  catch (e) { if (e.code === 'auth/email-already-in-use') cred = await a.signInWithEmailAndPassword(FB.auth2, email, pw); else throw e; }
+  const newUid = cred.user.uid; await a.signOut(FB.auth2);
+  if (priv && priv.uid && priv.uid !== newUid) await f.deleteDoc(f.doc(FB.db, 'roles', priv.uid)).catch(() => {});
+  await f.setDoc(f.doc(FB.db, 'roles', newUid), { role: 'guru', guruId: g.id });
+  return { ic: g.ic, uid: newUid };
+}
+async function fbSaveGuru(g) {
+  const { f } = FB; const pref = f.doc(FB.db, 'guruPrivate', g.id);
+  const old = (await f.getDoc(pref)).data() || {};
+  let priv = old;
+  if (icDigits(old.ic) !== icDigits(g.ic) || !old.uid) priv = await ensureGuruAccount(g, old);
+  const pub = clean(g); delete pub.ic;
+  await f.setDoc(f.doc(FB.db, 'guru', g.id), pub);
+  await f.setDoc(pref, clean({ ic: g.ic || '', uid: priv.uid || '' }));
+}
+async function fbDelGuru(id) {
+  const { f } = FB; const pref = f.doc(FB.db, 'guruPrivate', id);
+  const priv = (await f.getDoc(pref)).data();
+  if (priv && priv.uid) await f.deleteDoc(f.doc(FB.db, 'roles', priv.uid)).catch(() => {});
+  await f.deleteDoc(pref); await f.deleteDoc(f.doc(FB.db, 'guru', id));
+}
+async function fbBatch(ops) { // ops: [{t:'set'|'del', col, id, data}]
+  const { f } = FB;
+  for (let i = 0; i < ops.length; i += 400) {
+    const b = f.writeBatch(FB.db);
+    ops.slice(i, i + 400).forEach(o => o.t === 'set' ? b.set(f.doc(FB.db, o.col, o.id), clean(o.data)) : b.delete(f.doc(FB.db, o.col, o.id)));
+    await b.commit();
+  }
 }
 const DB = {
   async load() {
-    if (GAS) return JSON.parse(await gas('apiLoad'));
-    try { return JSON.parse(ls.get(LS_KEY)); } catch (e) { return null; }
+    if (!FB_ON) { try { return JSON.parse(ls.get(LS_KEY)); } catch (e) { return null; } }
+    await fbInit(); const { f } = FB;
+    const out = {};
+    await Promise.all(COLS.map(async c => { const q = await f.getDocs(f.collection(FB.db, c)); out[c] = q.docs.map(d => Object.assign({ id: d.id }, d.data())); }));
+    const st = await f.getDoc(f.doc(FB.db, 'tetapan', 'utama'));
+    out.settings = st.exists() ? st.data() : {};
+    out._empty = COLS.every(c => !out[c].length);
+    if (S.user && S.user.role === 'admin') {
+      const pv = await f.getDocs(f.collection(FB.db, 'guruPrivate')); const m = new Map(pv.docs.map(d => [d.id, d.data()]));
+      out.guru.forEach(g => { const p = m.get(g.id); if (p) g.ic = p.ic; });
+    }
+    return out;
   },
-  local() { if (!GAS && !ls.set(LS_KEY, JSON.stringify(S.d))) toast('Storan pelayar tidak tersedia — data tidak kekal.', 'bad'); },
+  local() { if (!FB_ON && !ls.set(LS_KEY, JSON.stringify(S.d))) toast('Storan pelayar tidak tersedia — data tidak kekal.', 'bad'); },
   async run(fn, msg) {
-    busy(msg); try { await fn(); return true; } catch (e) { toast((e && e.message) || 'Ralat pelayan', 'bad'); console.error(e); return false; } finally { busy(false); }
+    busy(msg); try { await fn(); return true; } catch (e) { toast(fbErr(e), 'bad'); console.error(e); return false; } finally { busy(false); }
   },
   async put(col, rec, msg) {
     return this.run(async () => {
-      if (GAS) await gas('apiSave', S.token, col, JSON.stringify(rec));
+      if (FB_ON) { if (col === 'guru') await fbSaveGuru(rec); else await FB.f.setDoc(FB.f.doc(FB.db, col, rec.id), clean(rec)); }
       const a = S.d[col]; const i = a.findIndex(x => x.id === rec.id); if (i >= 0) a[i] = rec; else a.push(rec);
       this.local();
     }, msg);
   },
   async putMany(col, recs, msg) {
     return this.run(async () => {
-      if (GAS) await gas('apiSaveMany', S.token, col, JSON.stringify(recs));
+      if (FB_ON) { if (col === 'guru') { for (const g of recs) await fbSaveGuru(g); } else await fbBatch(recs.map(r => ({ t: 'set', col, id: r.id, data: r }))); }
       recs.forEach(rec => { const a = S.d[col]; const i = a.findIndex(x => x.id === rec.id); if (i >= 0) a[i] = rec; else a.push(rec); });
       this.local();
     }, msg);
   },
   async del(col, id) {
     return this.run(async () => {
-      if (GAS) await gas('apiDelete', S.token, col, id);
+      if (FB_ON) { if (col === 'guru') await fbDelGuru(id); else await FB.f.deleteDoc(FB.f.doc(FB.db, col, id)); }
       S.d[col] = S.d[col].filter(x => x.id !== id); this.local();
+    }, 'Memadam rekod...');
+  },
+  async delMany(col, ids) {
+    return this.run(async () => {
+      if (FB_ON) await fbBatch(ids.map(id => ({ t: 'del', col, id })));
+      const set = new Set(ids); S.d[col] = S.d[col].filter(x => !set.has(x.id)); this.local();
     }, 'Memadam rekod...');
   },
   async settings() {
     return this.run(async () => {
-      if (GAS) await gas('apiSaveSettings', S.token, JSON.stringify(S.d.settings));
+      if (FB_ON) { const s = clean(S.d.settings); delete s.adminPassword; await FB.f.setDoc(FB.f.doc(FB.db, 'tetapan', 'utama'), s); }
       this.local();
     }, 'Menyimpan tetapan...');
   },
   async replaceAll(d) {
     return this.run(async () => {
-      if (GAS) await gas('apiReplaceAll', S.token, JSON.stringify(d));
+      if (FB_ON) {
+        busy('Memadam data lama...');
+        const ops = [];
+        COLS.filter(c => c !== 'guru').forEach(c => { S.d[c].forEach(r => ops.push({ t: 'del', col: c, id: r.id })); });
+        await fbBatch(ops);
+        const keep = new Set((d.guru || []).map(g => g.id));
+        for (const g of S.d.guru) if (!keep.has(g.id)) await fbDelGuru(g.id);
+        busy('Menulis data baharu...');
+        const w = [];
+        COLS.filter(c => c !== 'guru').forEach(c => (d[c] || []).forEach(r => w.push({ t: 'set', col: c, id: r.id, data: r })));
+        await fbBatch(w);
+        let n = 0; for (const g of d.guru || []) { busy(`Mendaftar akaun guru ${++n}/${d.guru.length}...`); await fbSaveGuru(g); }
+        if (d.settings) { const s = clean(d.settings); delete s.adminPassword; await FB.f.setDoc(FB.f.doc(FB.db, 'tetapan', 'utama'), s); }
+      }
       S.d = normalize(d); this.local();
     }, 'Sedang diproses... Sila tunggu');
   }
@@ -392,7 +488,7 @@ function normalize(d) {
   const def = DEF_SETTINGS();
   d.settings = Object.assign(def, d.settings || {});
   d.settings.markah = Object.assign(DEF_SETTINGS().markah, d.settings.markah || {});
-  if (GAS) delete d.settings.adminPassword; // katalaluan hanya disemak di pelayan
+  if (FB_ON) delete d.settings.adminPassword; // katalaluan diurus oleh Firebase Auth
   return d;
 }
 
@@ -408,6 +504,7 @@ const guruById = id => S.d.guru.find(g => g.id === id);
 const unitsOf = k => S.d.unit.filter(u => u.kat === k).sort((a, b) => a.nama.localeCompare(b.nama));
 const ahliUnit = uid_ => { const u = unitById(uid_); return u ? S.d.murid.filter(m => m.unit && m.unit[u.kat] === u.id) : []; };
 const penasihat = u => (u.guru || []).map(guruById).filter(Boolean).map(g => g.nama).join(', ') || '<i class="mut">Belum ditetapkan</i>';
+const icM = m => canEdit() ? esc(m.ic) : esc(String(m.ic || '').replace(/^(.{0,6}).*?(.{0,2})$/, (a, x, y) => x.slice(0, 2) + '••••-••-••' + y));
 const kelasM = m => `${m.tahun ? m.tahun.replace('Tahun ', 'T') : ''} ${m.kelas || ''}`.trim();
 const pjUnit = id => S.d.perjumpaan.filter(p => p.unitId === id).sort((a, b) => (a.bil || 0) - (b.bil || 0) || String(a.tarikh).localeCompare(b.tarikh));
 const singkat = n => n.split(/\s+/).filter(w => w.length > 2 && !/^(dan|&)$/i.test(w)).map(w => w[0]).join('').slice(0, 2).toUpperCase() || n.slice(0, 2).toUpperCase();
@@ -585,11 +682,15 @@ const App = {
     try { S.d = normalize(await DB.load() || demoData()); toast('Data dikemas kini.'); } catch (e) { toast('Gagal memuat data', 'bad'); }
     busy(false); applyTheme(); App.refresh();
   },
-  logout() { S.user = null; S.token = null; ss.del('koko_sess'); showLogin(); renderNav(); },
+  async logout() {
+    S.user = null; S.token = null; ss.del('koko_sess');
+    if (FB_ON) { busy('Log keluar...'); try { await FB.a.signOut(FB.auth); await FB.a.signInAnonymously(FB.auth); S.d.guru.forEach(g => delete g.ic); } catch (e) {} busy(false); }
+    showLogin(); renderNav(); App.refresh();
+  },
   userMenu() {
     const u = S.user; if (!u) return showLogin();
     const id = modal('<i class="fa-regular fa-user"></i> Akaun Pengguna', `<div class="row"><div class="av" style="width:44px;height:44px;font-size:17px">${esc(u.nama[0])}</div><div><b>${esc(u.nama)}</b><div class="mut sm">${u.role === 'admin' ? 'Pentadbir Sistem' : u.role === 'guru' ? 'Guru' : 'Tetamu Awam (baca sahaja)'}</div></div></div>
-      <p class="mut sm mt">Mod data: <b>${GAS ? 'Google Sheet (Apps Script)' : 'Storan pelayar (tempatan)'}</b></p>`,
+      <p class="mut sm mt">Mod data: <b>${FB_ON ? 'Firebase Firestore (' + esc(FIREBASE_CONFIG.projectId) + ')' : 'Demo — storan pelayar (tempatan)'}</b></p>`,
       `<button class="btn" onclick="closeM()">Tutup</button><button class="btn bad" onclick="closeM();App.logout()"><i class="fa-solid fa-right-from-bracket"></i> Log Keluar</button>`, 'sm');
   },
   notif() {
@@ -646,7 +747,7 @@ function showLogin() {
     </div>
   </div><div class="row sm" style="justify-content:space-between;padding:12px 22px;border-top:1px solid var(--bd);margin-top:14px"><span class="mut" style="font-size:11px">Log masuk untuk mengubah data.</span><a style="color:var(--ok);font-weight:600;cursor:pointer;font-size:11.5px" onclick="App.guide()"><i class="fa-solid fa-book-open"></i> Panduan Penggunaan</a></div></div>`;
   document.body.appendChild(w);
-  if (!GAS && S.d.settings.adminPassword === 'admin123') {
+  if (!FB_ON && S.d.settings.adminPassword === 'admin123') {
     const n = document.createElement('p'); n.className = 'mut'; n.style.cssText = 'text-align:center;font-size:11px;margin:10px 0 0';
     n.innerHTML = 'Demo: pilih <b>Pentadbir Sistem</b>, katalaluan <b>admin123</b>'; $('#lf1').appendChild(n);
   }
@@ -659,20 +760,42 @@ async function doLogin() {
   busy('Sedang mengesahkan log masuk...');
   try {
     let r;
-    if (GAS) r = JSON.parse(await gas('apiLogin', who, pw));
+    if (FB_ON) r = await fbLogin(who, pw);
     else if (who === 'admin') r = pw === S.d.settings.adminPassword ? { ok: true, role: 'admin', nama: 'Pentadbir Sistem', id: 'admin' } : { ok: false, msg: 'Katalaluan pentadbir salah.' };
     else { const g = guruById(who); const n = v => String(v || '').replace(/\D/g, ''); r = g && n(g.ic) && n(g.ic) === n(pw) ? { ok: true, role: 'guru', nama: g.nama, id: g.id } : { ok: false, msg: 'No. KP tidak sepadan.' }; }
     busy(false);
     if (!r.ok) return toast(r.msg, 'bad');
     setUser(r);
     toast(`Log masuk berjaya sebagai ${r.nama} (${r.role === 'admin' ? 'Pentadbir' : 'Guru'})`);
-  } catch (e) { busy(false); toast('Ralat: ' + (e.message || e), 'bad'); }
+  } catch (e) { busy(false); toast(fbErr(e), 'bad'); }
 }
 function guestLogin() { setUser({ role: 'tetamu', nama: 'Tetamu Awam', id: 'tetamu' }); toast('Anda dalam mod tetamu (baca sahaja).', 'info'); }
-function setUser(r) {
+async function fbLogin(who, pw) {
+  const { a, f } = FB;
+  if (who === 'admin') {
+    await a.signInWithEmailAndPassword(FB.auth, ADMIN_EMAIL, pw);
+    return { ok: true, role: 'admin', nama: 'Pentadbir Sistem', id: 'admin' };
+  }
+  const { email, pw: p } = await guruCred(who, pw);
+  try { await a.signInWithEmailAndPassword(FB.auth, email, p); }
+  catch (e) { if (/invalid-credential|user-not-found|wrong-password/.test(e.code || '')) return { ok: false, msg: 'No. KP tidak sepadan, atau akaun guru belum didaftarkan oleh pentadbir.' }; throw e; }
+  const role = (await f.getDoc(f.doc(FB.db, 'roles', FB.auth.currentUser.uid))).data();
+  if (!role || role.guruId !== who) { await a.signOut(FB.auth); await a.signInAnonymously(FB.auth); return { ok: false, msg: 'Akaun guru tidak aktif. Hubungi pentadbir.' }; }
+  return { ok: true, role: 'guru', nama: (guruById(who) || {}).nama || 'Guru', id: who };
+}
+/** Pulihkan sesi Firebase sedia ada (selepas muat semula halaman). */
+async function fbRestore() {
+  const u = FB.auth.currentUser; if (!u || u.isAnonymous) return null;
+  if (u.email && u.email.toLowerCase() === ADMIN_EMAIL.toLowerCase()) return { role: 'admin', nama: 'Pentadbir Sistem', id: 'admin' };
+  const r = (await FB.f.getDoc(FB.f.doc(FB.db, 'roles', u.uid))).data();
+  if (r && guruById(r.guruId)) return { role: 'guru', nama: guruById(r.guruId).nama, id: r.guruId };
+  return null;
+}
+async function setUser(r) {
   S.user = { role: r.role, nama: r.nama, id: r.id }; S.token = r.token || null;
   ss.set('koko_sess', JSON.stringify({ user: S.user, token: S.token }));
   const l = $('#login'); l && l.remove();
+  if (FB_ON && r.role === 'admin') { busy('Memuatkan data pentadbir...'); try { S.d = normalize(await DB.load()); } catch (e) { toast(fbErr(e), 'bad'); } busy(false); if (S.d._empty) toast('Pangkalan data Firebase kosong. Pergi ke Pengurusan & Admin > Sandaran Data untuk mula.', 'info'); }
   App.go(S.page || 'utama');
 }
 
@@ -684,7 +807,7 @@ function initSearch() {
     if (!s) { box.classList.add('hide'); return; }
     items = [];
     Object.entries(TITLES).forEach(([p, t]) => { if (t.toLowerCase().includes(s) && (p !== 'admin' || isAdmin())) items.push({ ic: 'fa-arrow-right', t, s: 'Halaman', f: () => App.go(p) }); });
-    S.d.murid.filter(m => m.nama.toLowerCase().includes(s) || String(m.ic).includes(s)).slice(0, 8).forEach(m => items.push({ ic: 'fa-user-graduate', t: m.nama, s: `Murid • ${kelasM(m)} • ${m.ic}`, f: () => profilMurid(m.id) }));
+    S.d.murid.filter(m => m.nama.toLowerCase().includes(s) || (canEdit() && String(m.ic).includes(s))).slice(0, 8).forEach(m => items.push({ ic: 'fa-user-graduate', t: m.nama, s: `Murid • ${kelasM(m)}`, f: () => profilMurid(m.id) }));
     S.d.unit.filter(u => u.nama.toLowerCase().includes(s)).slice(0, 5).forEach(u => items.push({ ic: KAT[u.kat].ic, t: u.nama, s: 'Unit • ' + KAT[u.kat].nama, f: () => { S.st.lapUnit = u.id; App.go('laporan'); } }));
     S.d.program.filter(p => p.nama.toLowerCase().includes(s)).slice(0, 5).forEach(p => items.push({ ic: 'fa-calendar-days', t: p.nama, s: `Program • ${p.peringkat} • ${fmtD(p.tarikh)}`, f: () => lihatProgram(p.id) }));
     S.d.guru.filter(g => g.nama.toLowerCase().includes(s)).slice(0, 4).forEach(g => items.push({ ic: 'fa-chalkboard-user', t: g.nama, s: 'Guru', f: () => { if (isAdmin()) { S.st.admTab = 'guru'; App.go('admin'); } } }));
@@ -730,16 +853,18 @@ function cetak(title, html) {
 async function boot() {
   try { applyTheme && (document.documentElement.dataset.theme = ls.get('koko_dark') === '1' ? 'dark' : 'light'); } catch (e) {}
   $('#pg').innerHTML = loader('Memuatkan sistem...');
-  let d = null;
-  try { d = await DB.load(); } catch (e) { toast('Gagal memuat data: ' + (e.message || e), 'bad'); }
+  let d = null, restored = null;
+  try {
+    if (FB_ON) { await fbInit(); d = await DB.load(); S.d = normalize(d); restored = await fbRestore(); if (restored && restored.role === 'admin') { S.user = restored; d = await DB.load(); } }
+    else d = await DB.load();
+  } catch (e) { console.error(e); toast('Gagal menyambung ke Firebase: ' + fbErr(e), 'bad'); if (FB_ON) d = { _err: true }; }
   if (!d) { d = demoData(); S.d = d; DB.local(); }
   S.d = normalize(d);
   applyTheme(); initSearch();
-  const sess = ss.get('koko_sess');
-  if (sess) { try { const o = JSON.parse(sess); S.user = o.user; S.token = o.token; } catch (e) {} }
+  if (FB_ON) { if (restored) S.user = restored; else { const o = (() => { try { return JSON.parse(ss.get('koko_sess')); } catch (e) { return null; } })(); if (o && o.user && o.user.role === 'tetamu') S.user = o.user; } }
+  else { const sess = ss.get('koko_sess'); if (sess) { try { const o = JSON.parse(sess); S.user = o.user; S.token = o.token; } catch (e) {} } }
   App.go('utama');
   if (!S.user) showLogin();
-  else if (GAS && S.d._empty && isAdmin()) toast('Pangkalan data kosong. Pergi ke Setup > Sandaran Data untuk mula.', 'info');
 }
 window.addEventListener('DOMContentLoaded', boot);
 </script>
@@ -912,7 +1037,7 @@ Pages.kehadiran = () => {
   <div class="card"><div class="row pad" style="justify-content:space-between;border-bottom:1px solid var(--bd)"><div><b>${esc(p.aktiviti)}</b><div class="mut sm">${fmtD(p.tarikh)} • ${esc(p.masa || '')} • ${esc(p.tempat || '')}</div></div>
     ${canEdit() ? `<div class="row"><button class="btn sm" onclick="khSemua(true)">Semua Hadir</button><button class="btn sm" onclick="khSemua(false)">Semua Tidak</button><button class="btn pri" onclick="simpanKh('${p.id}')"><i class="fa-solid fa-floppy-disk"></i> Simpan Kehadiran</button></div>` : ''}</div>
   <div class="tw"><table class="t"><thead><tr><th>Bil</th><th>Nama Murid</th><th>Kelas</th><th class="c">Status</th></tr></thead><tbody id="khRows">
-  ${ahli.map((m, i) => `<tr><td>${i + 1}</td><td><b>${esc(m.nama)}</b><div class="mut" style="font-size:11px">${esc(m.ic)} • ${esc(m.jantina)}</div></td><td>${kelasM(m)}</td>
+  ${ahli.map((m, i) => `<tr><td>${i + 1}</td><td><b>${esc(m.nama)}</b><div class="mut" style="font-size:11px">${icM(m)} • ${esc(m.jantina)}</div></td><td>${kelasM(m)}</td>
     <td class="c"><div class="tabs" style="padding:3px" data-m="${m.id}" data-h="${h.has(m.id) ? 1 : 0}"><button class="tab ${h.has(m.id) ? 'on' : ''}" style="padding:5px 10px;color:${h.has(m.id) ? 'var(--ok)' : ''}" onclick="khSet(this,1)"><i class="fa-solid fa-check"></i> Hadir</button><button class="tab ${!h.has(m.id) ? 'on' : ''}" style="padding:5px 10px;color:${!h.has(m.id) ? 'var(--bad)' : ''}" onclick="khSet(this,0)"><i class="fa-solid fa-xmark"></i> Tidak</button></div></td></tr>`).join('')}
   </tbody></table></div></div>`}`;
 };
@@ -952,7 +1077,7 @@ function anMurid() {
     let h = 0; const cells = [];
     for (let c = 0; c < cols; c++) { const p = pj[c]; if (!p) cells.push('<td class="c"><span class="mark x">–</span></td>'); else { const y = (p.hadir || []).includes(m.id); if (y) h++; cells.push(`<td class="c"><span class="mark ${y ? 'y' : 'n'}" title="${fmtD(p.tarikh)}">${y ? '✓' : '✗'}</span></td>`); } }
     tot += pj.length; totH += h; if (pj.length && h === pj.length) penuh++;
-    return `<tr><td>${i + 1}</td><td style="min-width:220px"><b style="font-size:12px">${esc(m.nama)}</b><div class="mut" style="font-size:10.5px">${esc(m.ic)} • ${esc(m.jantina)}</div></td><td class="c"><span class="bdg">${kelasM(m)}</span></td><td>${u ? `<span class="bdg vio">${esc(u.nama)}</span>` : '<span class="bdg">Tiada Unit</span>'}</td>${cells.join('')}<td class="c">${pj.length ? `<b>${h}/${pj.length}</b> <span class="bdg ${pct(h, pj.length) >= 75 ? 'ok' : 'bad'}">${pct(h, pj.length)}%</span>` : '<i class="mut" style="font-size:11px">Belum direkod</i>'}</td></tr>`;
+    return `<tr><td>${i + 1}</td><td style="min-width:220px"><b style="font-size:12px">${esc(m.nama)}</b><div class="mut" style="font-size:10.5px">${icM(m)} • ${esc(m.jantina)}</div></td><td class="c"><span class="bdg">${kelasM(m)}</span></td><td>${u ? `<span class="bdg vio">${esc(u.nama)}</span>` : '<span class="bdg">Tiada Unit</span>'}</td>${cells.join('')}<td class="c">${pj.length ? `<b>${h}/${pj.length}</b> <span class="bdg ${pct(h, pj.length) >= 75 ? 'ok' : 'bad'}">${pct(h, pj.length)}%</span>` : '<i class="mut" style="font-size:11px">Belum direkod</i>'}</td></tr>`;
   });
   const klOpts = S.d.settings.tahun.map(t => `<optgroup label="${esc(t)}">${opt(t, 'Semua ' + t, kl)}${S.d.settings.kelas.map(c => opt(`${t}|${c}`, `${t.replace('Tahun ', '')} ${c}`, kl)).join('')}</optgroup>`).join('');
   return `<div class="card pad mb"><div class="grid gf" style="grid-template-columns:1fr 1.3fr 1fr auto;gap:12px">
@@ -1221,7 +1346,7 @@ Pages.pencapaian = () => {
     <div class="mut sm" style="text-align:right;margin-top:8px">Memaparkan <b>${rows.length}</b> murid</div></div>
   <div class="chips mb">${chips.map(([k, ic, t]) => `<button class="chip ${mode === k ? 'on' : ''}" onclick="S.st.pcMode='${k}';App.refresh()"><i class="fa-solid ${ic}"></i> ${t}</button>`).join('')}</div>
   <div class="card"><div class="tw"><table class="t"><thead><tr><th>Bil</th><th>Nama Murid &amp; Tahun/Kelas</th><th>No. KP</th><th>Unit Kokurikulum (BB / KP / SP)</th><th class="c">Jumlah Markah</th><th class="c">Pencapaian</th><th class="c">Program</th><th class="c">Jawatan</th><th class="c">Kehadiran</th><th class="c">Ekstra</th><th class="c">Tindakan</th></tr></thead><tbody>
-  ${rows.map(({ m, s, k }, i) => { const x = k || s; return `<tr><td>${mode !== 'semua' && i < 3 ? ['🥇', '🥈', '🥉'][i] : i + 1}</td><td style="min-width:200px"><b style="font-size:12px">${esc(m.nama)}</b><div class="mut" style="font-size:10.5px">${kelasM(m)}</div></td><td style="font-size:11px">${esc(m.ic)}</td><td style="max-width:260px">${kb(m) || '<span class="mut sm">-</span>'}</td>
+  ${rows.map(({ m, s, k }, i) => { const x = k || s; return `<tr><td>${mode !== 'semua' && i < 3 ? ['🥇', '🥈', '🥉'][i] : i + 1}</td><td style="min-width:200px"><b style="font-size:12px">${esc(m.nama)}</b><div class="mut" style="font-size:10.5px">${kelasM(m)}</div></td><td style="font-size:11px">${icM(m)}</td><td style="max-width:260px">${kb(m) || '<span class="mut sm">-</span>'}</td>
     <td class="c"><b style="font-size:15px;color:var(--p)">${x.jumlah}</b> <span class="bdg ${x.jumlah >= 60 ? 'ok' : x.jumlah >= 40 ? 'warn' : 'bad'}">${gred(x.jumlah)}</span></td><td class="c">${x.pencapaian}</td><td class="c">${x.program}</td><td class="c">${x.jawatan}</td><td class="c">${x.kehadiran}<div class="mut" style="font-size:10px">${x.kh.h}/${x.kh.t}</div></td><td class="c">${x.ekstra}</td>
     <td class="c"><button class="btn sm" onclick="profilMurid('${m.id}')"><i class="fa-solid fa-address-card"></i> Profil</button></td></tr>`; }).join('') || `<tr><td colspan="11">${empty('Tiada murid sepadan.')}</td></tr>`}
   </tbody></table></div></div>
@@ -1230,7 +1355,7 @@ Pages.pencapaian = () => {
 function profilMurid(id) {
   const m = muridById(id); if (!m) return; const s = skor(m), M = S.d.settings.markah;
   const bar = (t, v, mx, c) => `<div style="margin-bottom:9px"><div class="row sm" style="justify-content:space-between"><span>${t}</span><b>${v} / ${mx}</b></div><div class="bar"><span style="width:${pct(v, mx)}%;background:${c}"></span></div></div>`;
-  const html = `<div class="row mb" style="flex-wrap:nowrap"><div class="av" style="width:54px;height:54px;font-size:20px;flex-basis:54px;background:${m.jantina === 'Lelaki' ? '#cffafe' : '#ffe4e6'}">${esc(m.nama[0])}</div><div style="flex:1"><b style="font-size:15px">${esc(m.nama)}</b><div class="mut sm">${esc(m.ic)} • ${esc(m.jantina)} • ${kelasM(m)}</div></div>
+  const html = `<div class="row mb" style="flex-wrap:nowrap"><div class="av" style="width:54px;height:54px;font-size:20px;flex-basis:54px;background:${m.jantina === 'Lelaki' ? '#cffafe' : '#ffe4e6'}">${esc(m.nama[0])}</div><div style="flex:1"><b style="font-size:15px">${esc(m.nama)}</b><div class="mut sm">${icM(m)} • ${esc(m.jantina)} • ${kelasM(m)}</div></div>
     <div style="text-align:center"><div style="font-size:28px;font-weight:800;color:var(--p)">${s.jumlah}</div><span class="bdg ${s.jumlah >= 60 ? 'ok' : 'warn'}">Gred ${gred(s.jumlah)}</span></div></div>
   <div class="grid g2 mb"><div class="card pad"><b class="sm">PECAHAN MARKAH</b><div class="mt">${bar('Kehadiran', s.kehadiran, M.kehadiran, 'var(--ok)')}${bar('Jawatan', s.jawatan, Math.max(...Object.values(M.jawatan)), 'var(--vio)')}${bar('Pencapaian', s.pencapaian, M.maxPencapaian, 'var(--warn)')}${bar('Penglibatan Program', s.program, M.maxProgram, 'var(--info)')}${bar('Ekstra Kurikulum', s.ekstra, M.maxEkstra, 'var(--bad)')}</div></div>
     <div class="card pad"><b class="sm">UNIT KOKURIKULUM</b>${KATS.map(k => { const u = unitById(m.unit && m.unit[k]); if (!u) return `<div class="row mt"><span class="bdg">${k}</span><span class="mut sm">Tiada unit</span></div>`; const kh = kehadiranMurid(m, [k]); const jw = S.d.jawatan.find(j => j.unitId === u.id && j.muridId === m.id); return `<div class="row mt" style="flex-wrap:nowrap"><span class="bdg" style="background:${KAT[k].bg};color:${KAT[k].c}">${k}</span><div style="flex:1"><b class="sm">${esc(u.nama)}</b> ${jw ? `<span class="bdg vio">${esc(jw.jawatan)}</span>` : ''}<div class="mut" style="font-size:11px">${k === 'RS' ? 'Rumah Sukan' : `Hadir ${kh.h}/${kh.t} (${pct(kh.h, kh.t)}%)`}</div></div></div>`; }).join('')}</div></div>
@@ -1240,7 +1365,7 @@ function profilMurid(id) {
 }
 function cetakProfil(id) {
   const m = muridById(id), s = skor(m);
-  cetak('Profil ' + m.nama, `<h2 style="text-align:center">PROFIL KOKURIKULUM MURID</h2><table><tr><th style="width:25%">Nama</th><td>${esc(m.nama)}</td></tr><tr><th>No. KP</th><td>${esc(m.ic)}</td></tr><tr><th>Tahun / Kelas</th><td>${esc(m.tahun)} ${esc(m.kelas)}</td></tr>
+  cetak('Profil ' + m.nama, `<h2 style="text-align:center">PROFIL KOKURIKULUM MURID</h2><table><tr><th style="width:25%">Nama</th><td>${esc(m.nama)}</td></tr><tr><th>No. KP</th><td>${icM(m)}</td></tr><tr><th>Tahun / Kelas</th><td>${esc(m.tahun)} ${esc(m.kelas)}</td></tr>
   ${KATS.map(k => `<tr><th>${KAT[k].nama}</th><td>${esc((unitById(m.unit && m.unit[k]) || {}).nama || '-')}</td></tr>`).join('')}</table>
   <table><tr><th>Kehadiran</th><th>Jawatan</th><th>Pencapaian</th><th>Program</th><th>Ekstra</th><th>JUMLAH</th><th>GRED</th></tr><tr><td>${s.kehadiran}</td><td>${s.jawatan}</td><td>${s.pencapaian}</td><td>${s.program}</td><td>${s.ekstra}</td><td><b>${s.jumlah}</b></td><td><b>${gred(s.jumlah)}</b></td></tr></table>
   <h2>Jawatan</h2><table><tr><th>Unit</th><th>Jawatan</th></tr>${s.jws.map(j => `<tr><td>${esc((unitById(j.unitId) || {}).nama || '')}</td><td>${esc(j.jawatan)}</td></tr>`).join('') || '<tr><td colspan="2">Ahli Biasa</td></tr>'}</table>
@@ -1334,8 +1459,8 @@ function admProfil() {
     <input class="in mb" id="sp_n" value="${esc(s.namaSekolah)}" style="font-weight:700;font-size:15px">
     <div class="grid g2 mb"><div><label class="l">Sesi</label><input class="in" id="sp_s" value="${esc(s.sesi)}" placeholder="cth: 2026"></div><div><label class="l">Alamat</label><input class="in" id="sp_a" value="${esc(s.alamat)}" placeholder="Alamat sekolah"></div></div>
     <div class="card pad" style="background:var(--soft)"><div class="row" style="justify-content:space-between"><b class="sm"><i class="fa-solid fa-key" style="color:var(--ok)"></i> KATALALUAN PENTADBIR (ADMIN PASSWORD)</b><span class="bdg ok">Boleh Diubah</span></div>
-      <label class="l mt">Katalaluan Pentadbir ${GAS ? 'Baharu' : 'Semasa'}:</label><div style="position:relative;max-width:380px"><input class="in" id="sp_pw" type="password" value="${GAS ? '' : esc(s.adminPassword)}" placeholder="${GAS ? 'Biarkan kosong jika tidak mahu tukar' : ''}"><button class="icb" style="position:absolute;right:5px;top:5px" onclick="const i=$('#sp_pw');i.type=i.type==='password'?'text':'password'"><i class="fa-solid fa-key"></i></button></div>
-      <div class="mut" style="font-size:11px;margin-top:5px">Katalaluan asal adalah <b style="color:var(--ok)">admin123</b>. Sila tukar selepas pemasangan.</div></div></div>
+      <label class="l mt">Katalaluan Pentadbir ${FB_ON ? 'Baharu' : 'Semasa'}:</label><div style="position:relative;max-width:380px"><input class="in" id="sp_pw" type="password" value="${FB_ON ? '' : esc(s.adminPassword)}" placeholder="${FB_ON ? 'Biarkan kosong jika tidak mahu tukar (min. 6 aksara)' : ''}"><button class="icb" style="position:absolute;right:5px;top:5px" onclick="const i=$('#sp_pw');i.type=i.type==='password'?'text':'password'"><i class="fa-solid fa-key"></i></button></div>
+      <div class="mut" style="font-size:11px;margin-top:5px">${FB_ON ? `Akaun pentadbir: <b>${esc(ADMIN_EMAIL)}</b> (Firebase Authentication).` : 'Katalaluan asal adalah <b style="color:var(--ok)">admin123</b>. Sila tukar selepas pemasangan.'}</div></div></div>
   <div class="grid g2 mb">
     <div class="card pad"><b><i class="fa-solid fa-palette" style="color:var(--ok)"></i> Warna Tema Utama Portal</b><div class="mut sm" style="margin:4px 0 14px">Pilih warna identiti sekolah. Bar atas dan butang utama akan mengikut warna ini.</div>
       <label class="l">Pilihan Warna Rasmi:</label><div class="row" id="sp_th">${THEMES.map(c => `<span class="swatch ${s.theme === c ? 'on' : ''}" style="background:${c}" data-c="${c}" onclick="pilihTema('${c}')">${s.theme === c ? '✓' : ''}</span>`).join('')}<input type="color" value="${s.theme}" oninput="pilihTema(this.value)" style="width:40px;height:40px;border:0;background:none;cursor:pointer" title="Warna lain"></div></div>
@@ -1354,8 +1479,14 @@ function bacaLogo(file) {
 }
 async function simpanProfil() {
   const s = S.d.settings; s.namaSekolah = val('sp_n') || s.namaSekolah; s.sesi = val('sp_s'); s.alamat = val('sp_a');
-  const pw = val('sp_pw'); if (pw) { if (pw.length < 4) return toast('Katalaluan terlalu pendek.', 'bad'); s.adminPassword = pw; } else if (GAS) delete s.adminPassword;
-  if (await DB.settings()) { if (GAS) delete s.adminPassword; toast('Profil sekolah disimpan.'); renderNav(); }
+  const pw = val('sp_pw');
+  if (pw && FB_ON) {
+    if (pw.length < 6) return toast('Katalaluan Firebase mesti sekurang-kurangnya 6 aksara.', 'bad');
+    const ok = await DB.run(() => FB.a.updatePassword(FB.auth.currentUser, pw), 'Menukar katalaluan...');
+    if (!ok) return toast('Jika ralat "requires-recent-login", log keluar dan log masuk semula kemudian cuba lagi.', 'info');
+    $('#sp_pw').value = ''; toast('Katalaluan pentadbir ditukar.');
+  } else if (pw) { if (pw.length < 4) return toast('Katalaluan terlalu pendek.', 'bad'); s.adminPassword = pw; }
+  if (await DB.settings()) { toast('Profil sekolah disimpan.'); renderNav(); }
 }
 
 /* ---- Murid ---- */
@@ -1388,9 +1519,7 @@ async function padamBanyakMurid() {
   const q = (S.st.amQ || '').toLowerCase(), t = S.st.amT || '';
   const ids = S.d.murid.filter(m => (!t || m.tahun === t) && (!q || m.nama.toLowerCase().includes(q) || String(m.ic).includes(q))).map(m => m.id);
   if (!await confirmBox(`Padam <b>${ids.length}</b> murid yang dipaparkan? Tindakan ini tidak boleh dibatalkan.`)) return;
-  const d = JSON.parse(JSON.stringify(S.d)); const set = new Set(ids); d.murid = d.murid.filter(m => !set.has(m.id));
-  if (GAS) await DB.replaceAll(d); else { S.d = d; DB.local(); }
-  toast(ids.length + ' murid dipadam.'); App.refresh();
+  if (await DB.delMany('murid', ids)) { toast(ids.length + ' murid dipadam.'); App.refresh(); }
 }
 function importMurid() {
   const mid = modal('<i class="fa-solid fa-paste"></i> Import Murid dari Excel / Google Sheet', `
@@ -1436,7 +1565,7 @@ function eksportMuridCSV() {
 /* ---- Guru ---- */
 function admGuru() {
   const gs = S.d.guru.slice().sort(sortNama);
-  return `<div class="card pad mb row" style="justify-content:space-between"><span class="sm mut">Guru log masuk menggunakan <b>No. KP</b> sebagai katalaluan.</span><div class="row"><button class="btn" onclick="importGuru()"><i class="fa-solid fa-paste"></i> Tampal Senarai</button><button class="btn pri" onclick="formGuru()"><i class="fa-solid fa-plus"></i> Tambah Guru</button></div></div>
+  return `<div class="card pad mb row" style="justify-content:space-between"><span class="sm mut">Guru log masuk menggunakan <b>No. KP</b> sebagai katalaluan.${FB_ON ? ' Akaun Firebase dicipta automatik semasa simpan.' : ''}</span><div class="row"><button class="btn" onclick="importGuru()"><i class="fa-solid fa-paste"></i> Tampal Senarai</button><button class="btn pri" onclick="formGuru()"><i class="fa-solid fa-plus"></i> Tambah Guru</button></div></div>
   <div class="card"><div class="tw"><table class="t"><thead><tr><th>Bil</th><th>Nama Guru</th><th>No. KP</th><th>Telefon</th><th>Unit Dinasihati</th><th class="c">Tindakan</th></tr></thead><tbody>
   ${gs.map((g, i) => `<tr><td>${i + 1}</td><td><b>${esc(g.nama)}</b><div class="mut" style="font-size:11px">${esc(g.jawatan || '')}</div></td><td style="font-size:11.5px">${esc(g.ic)}</td><td style="font-size:11.5px">${esc(g.tel || '')}</td><td>${S.d.unit.filter(u => (u.guru || []).includes(g.id)).map(u => `<span class="bdg vio" style="margin:1px">${esc(u.nama)}</span>`).join('') || '-'}</td><td class="c" style="white-space:nowrap"><button class="icb" onclick="formGuru('${g.id}')"><i class="fa-solid fa-pen"></i></button><button class="icb del" onclick="padamGuru('${g.id}')"><i class="fa-solid fa-trash"></i></button></td></tr>`).join('') || `<tr><td colspan="6">${empty('Tiada guru.')}</td></tr>`}
   </tbody></table></div></div>`;
@@ -1540,8 +1669,8 @@ async function simpanTetapan() {
 /* ---- Sandaran ---- */
 function admSandaran() {
   const c = COLS.map(k => `<div class="card stat"><div><small style="text-transform:capitalize">${k}</small><b>${S.d[k].length}</b></div></div>`).join('');
-  return `<div class="card pad mb"><b><i class="fa-solid fa-circle-info" style="color:var(--info)"></i> Mod Penyimpanan: ${GAS ? 'Google Sheet (Apps Script)' : 'Storan Pelayar (localStorage)'}</b>
-    <p class="sm mut" style="line-height:1.6;margin-bottom:0">${GAS ? 'Semua data disimpan dalam Google Sheet yang dihubungkan dengan skrip ini — setiap koleksi dalam tab tersendiri.' : 'Data disimpan dalam pelayar ini sahaja. Untuk berkongsi data antara guru, pasang sistem sebagai <b>Web App Google Apps Script</b> (lihat README dalam repo). Buat sandaran secara berkala.'}</p></div>
+  return `<div class="card pad mb"><b><i class="fa-solid fa-circle-info" style="color:var(--info)"></i> Mod Penyimpanan: ${FB_ON ? 'Firebase Firestore — ' + esc(FIREBASE_CONFIG.projectId) : 'Demo — Storan Pelayar (localStorage)'}</b>
+    <p class="sm mut" style="line-height:1.6;margin-bottom:0">${FB_ON ? 'Semua data disimpan dalam Cloud Firestore dan dikongsi secara masa nyata oleh semua guru. Akaun log masuk guru dicipta automatik dalam Firebase Authentication apabila data guru disimpan.' : 'Data disimpan dalam pelayar ini sahaja. Untuk berkongsi data antara guru, isi <b>FIREBASE_CONFIG</b> dalam index.html (lihat README). Buat sandaran secara berkala.'}</p></div>
   <div class="grid g4 mb">${c}</div>
   <div class="grid g2">
     <div class="card pad"><b><i class="fa-solid fa-download"></i> Sandaran &amp; Pemulihan</b><p class="sm mut">Muat turun semua data sebagai fail JSON, atau pulihkan daripada fail sandaran.</p>
@@ -1552,13 +1681,13 @@ function admSandaran() {
 }
 function pulihSandaran() {
   const f = $('#fileIn'); f.accept = '.json,application/json'; f.value = '';
-  f.onchange = () => { const rd = new FileReader(); rd.onload = async () => { try { const d = JSON.parse(rd.result); if (!d.murid || !d.unit) throw 0; if (!await confirmBox(`Pulihkan sandaran (${d.murid.length} murid, ${d.unit.length} unit)? Semua data semasa akan diganti.`)) return; d.settings = Object.assign({}, d.settings, { adminPassword: GAS ? undefined : S.d.settings.adminPassword }); if (await DB.replaceAll(d)) { toast('Sandaran dipulihkan.'); applyTheme(); App.refresh(); } } catch (e) { toast('Fail sandaran tidak sah.', 'bad'); } }; rd.readAsText(f.files[0]); };
+  f.onchange = () => { const rd = new FileReader(); rd.onload = async () => { try { const d = JSON.parse(rd.result); if (!d.murid || !d.unit) throw 0; if (!await confirmBox(`Pulihkan sandaran (${d.murid.length} murid, ${d.unit.length} unit)? Semua data semasa akan diganti.`)) return; d.settings = Object.assign({}, d.settings, { adminPassword: FB_ON ? undefined : S.d.settings.adminPassword }); if (await DB.replaceAll(d)) { toast('Sandaran dipulihkan.'); applyTheme(); App.refresh(); } } catch (e) { toast('Fail sandaran tidak sah.', 'bad'); } }; rd.readAsText(f.files[0]); };
   f.click();
 }
-async function muatDemo() { if (!await confirmBox('Gantikan semua data dengan <b>data demo</b>?')) return; const d = demoData(); d.settings.adminPassword = GAS ? undefined : S.d.settings.adminPassword; d.settings.namaSekolah = S.d.settings.namaSekolah; d.settings.logo = S.d.settings.logo; d.settings.theme = S.d.settings.theme; if (await DB.replaceAll(d)) { toast('Data demo dimuatkan.'); App.refresh(); } }
+async function muatDemo() { if (!await confirmBox('Gantikan semua data dengan <b>data demo</b>?')) return; const d = demoData(); d.settings.adminPassword = FB_ON ? undefined : S.d.settings.adminPassword; d.settings.namaSekolah = S.d.settings.namaSekolah; d.settings.logo = S.d.settings.logo; d.settings.theme = S.d.settings.theme; if (await DB.replaceAll(d)) { toast('Data demo dimuatkan.'); App.refresh(); } }
 async function kosongkanData() {
   if (!await confirmBox('Padam <b>SEMUA</b> data murid, guru, unit, laporan, program dan pencapaian? Tindakan ini tidak boleh dibatalkan.')) return;
-  const d = normalize({ settings: Object.assign({}, S.d.settings, { adminPassword: GAS ? undefined : S.d.settings.adminPassword }) });
+  const d = normalize({ settings: Object.assign({}, S.d.settings, { adminPassword: FB_ON ? undefined : S.d.settings.adminPassword }) });
   if (await DB.replaceAll(d)) { toast('Semua data dikosongkan.'); App.refresh(); }
 }
 </script>

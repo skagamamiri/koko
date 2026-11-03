@@ -1,0 +1,42 @@
+rules_version = '2';
+
+// Firestore Security Rules — Sistem Pengurusan Kokurikulum Sekolah
+// 1. Tukar ADMIN_EMAIL di bawah supaya sama dengan ADMIN_EMAIL dalam index.html.
+// 2. Firebase Console > Firestore Database > Rules > tampal fail ini > Publish.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function isAnon()   { return signedIn() && request.auth.token.firebase.sign_in_provider == 'anonymous'; }
+    function isAdmin()  { return signedIn() && request.auth.token.email == 'admin@sekolah.edu.my'; } // <-- ADMIN_EMAIL
+    function isGuru()   { return signedIn() && exists(/databases/$(database)/documents/roles/$(request.auth.uid)); }
+
+    // Siapa boleh MEMBACA data umum?
+    //   signedIn()                 = semua termasuk Tetamu Awam (log masuk tanpa nama)
+    //   signedIn() && !isAnon()    = hanya guru & pentadbir (matikan mod tetamu)
+    function canRead() { return signedIn(); }
+
+    // Tetapan, guru, unit, murid — hanya pentadbir boleh ubah
+    match /tetapan/{id} { allow read: if canRead(); allow write: if isAdmin(); }
+    match /guru/{id}    { allow read: if canRead(); allow write: if isAdmin(); }
+    match /unit/{id}    { allow read: if canRead(); allow write: if isAdmin(); }
+    match /murid/{id}   { allow read: if canRead(); allow write: if isAdmin(); }
+
+    // Rekod aktiviti — guru & pentadbir boleh ubah
+    match /perjumpaan/{id} { allow read: if canRead(); allow write: if isAdmin() || isGuru(); }
+    match /program/{id}    { allow read: if canRead(); allow write: if isAdmin() || isGuru(); }
+    match /jawatan/{id}    { allow read: if canRead(); allow write: if isAdmin() || isGuru(); }
+    match /ekstra/{id}     { allow read: if canRead(); allow write: if isAdmin() || isGuru(); }
+    match /pencapaian/{id} { allow read: if canRead(); allow write: if isAdmin() || isGuru(); }
+
+    // No. KP guru (katalaluan) — pentadbir sahaja
+    match /guruPrivate/{id} { allow read, write: if isAdmin(); }
+
+    // Peranan akaun guru — dicipta oleh pentadbir
+    match /roles/{uid} {
+      allow read: if isAdmin() || (signedIn() && request.auth.uid == uid);
+      allow write: if isAdmin();
+    }
+  }
+}
